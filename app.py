@@ -29,21 +29,28 @@ def get_bj():
 # ── 股价（30秒刷新）─────────────────────────────────────────
 def refresh_quote():
     fail = 0
+    prev_close = None
     while True:
         try:
-            r = requests.get(f"{BASE}/quote", params={"symbol":"TSLA","apikey":API_KEY}, timeout=10)
+            # /price 返回实时价格，免费版全时段可用
+            r = requests.get(f"{BASE}/price", params={"symbol":"TSLA","apikey":API_KEY}, timeout=10)
             d = r.json()
-            if "code" in d or "close" not in d:
-                print(f"[Quote] API error response: {d}")
-                raise ValueError(f"Bad response: {d.get('message', d)}")
-            price = float(d["close"])
-            prev  = float(d["previous_close"])
-            change = round(price - prev, 2)
-            pct    = round((change / prev) * 100, 2)
+            print(f"[Quote] price response: {d}")
+            if "price" not in d:
+                raise ValueError(f"Bad response: {d}")
+            price = round(float(d["price"]), 2)
+            # 获取前收盘价（只需要拿一次）
+            if prev_close is None:
+                r2 = requests.get(f"{BASE}/eod", params={"symbol":"TSLA","apikey":API_KEY}, timeout=10)
+                d2 = r2.json()
+                print(f"[Quote] eod response: {d2}")
+                prev_close = float(d2.get("close", price))
+            change = round(price - prev_close, 2)
+            pct    = round((change / prev_close) * 100, 2) if prev_close else 0
             sign   = "+" if change >= 0 else ""
             with cache_lock:
                 cache["quote"] = {
-                    "price": f"${round(price,2)}",
+                    "price": f"${price}",
                     "change": f"{sign}{change}",
                     "change_pct": f"{sign}{pct}%",
                     "is_positive": change >= 0,
@@ -54,6 +61,7 @@ def refresh_quote():
         except Exception as e:
             print(f"[Quote] {e}")
             fail += 1
+            prev_close = None  # 重置，下次重新获取
             time.sleep(min(60 * fail, 300))
 
 # ── K线（5分钟刷新，1分钟粒度含盘前盘后）────────────────────

@@ -33,6 +33,9 @@ def refresh_quote():
         try:
             r = requests.get(f"{BASE}/quote", params={"symbol":"TSLA","apikey":API_KEY}, timeout=10)
             d = r.json()
+            if "code" in d or "close" not in d:
+                print(f"[Quote] API error response: {d}")
+                raise ValueError(f"Bad response: {d.get('message', d)}")
             price = float(d["close"])
             prev  = float(d["previous_close"])
             change = round(price - prev, 2)

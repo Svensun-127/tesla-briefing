@@ -104,82 +104,84 @@ def refresh_candles():
 def refresh_news():
     while True:
         try:
-            # 多个RSS源：非主流客观媒体
+            # 用Yahoo Finance RSS + Seeking Alpha RSS，不被Render封
             rss_sources = [
-                "https://news.google.com/rss/search?q=Tesla+TSLA+stock&hl=en-US&gl=US&ceid=US:en",
                 "https://feeds.finance.yahoo.com/rss/2.0/headline?s=TSLA&region=US&lang=en-US",
-                "https://news.google.com/rss/search?q=Tesla+electric+vehicle+analysis&hl=en-US&gl=US&ceid=US:en",
+                "https://electrek.co/feed/",
+                "https://www.teslarati.com/feed/",
+                "https://feeds.feedburner.com/TechCrunch",
             ]
-            # 排除主流偏见媒体，保留客观专业来源
             excluded = ["fox news", "msnbc", "buzzfeed", "tmz", "daily mail", "new york post", "breitbart"]
-            # 优先保留的专业财经媒体
             preferred = ["reuters", "bloomberg", "wsj", "wall street", "barron", "seeking alpha",
-                        "investopedia", "motley fool", "electrek", "teslarati", "the verge",
-                        "ars technica", "techcrunch", "financial times", "marketwatch", "benzinga"]
+                        "electrek", "teslarati", "ars technica", "techcrunch", "marketwatch", "benzinga", "yahoo"]
             seen = set()
             news = []
             for url in rss_sources:
                 try:
                     feed = feedparser.parse(url)
-                    for entry in feed.entries[:30]:
+                    for entry in feed.entries[:15]:
                         title = entry.title
                         if title in seen:
                             continue
+                        # 只保留含Tesla/TSLA关键词的文章
+                        if not any(kw in title.lower() for kw in ["tesla", "tsla", "elon", "musk", "ev ", "electric vehicle"]):
+                            continue
                         seen.add(title)
-                        source = entry.get("source", {}).get("title", "Unknown")
+                        source = entry.get("source", {}).get("title", "") or feed.feed.get("title", "Unknown")
                         if any(ex in source.lower() for ex in excluded):
                             continue
                         is_preferred = any(p in source.lower() for p in preferred)
-                        pub = entry.get("published", "")
                         news.append({
                             "title": title,
                             "url": entry.link,
                             "source": source,
-                            "published": pub,
+                            "published": entry.get("published", ""),
                             "preferred": is_preferred,
                         })
                 except Exception as e:
-                    print(f"[News] RSS error: {e}")
-            # 优先显示preferred来源，然后按时间排序
-            news.sort(key=lambda x: (not x["preferred"], x.get("published", "")), reverse=False)
+                    print(f"[News] RSS error {url}: {e}")
+            news.sort(key=lambda x: (not x["preferred"]))
             news = [{"title": n["title"], "url": n["url"], "source": n["source"], "published": n["published"]} for n in news[:8]]
+            print(f"[News] Loaded {len(news)} items")
             with cache_lock:
                 cache["news"] = news
         except Exception as e:
             print(f"[News] {e}")
-        time.sleep(900)  # 每15分钟刷新
+        time.sleep(900)
 
 def refresh_analyst_articles():
-    """抓取分析师分析文章"""
+    """从Yahoo Finance RSS抓分析师相关文章"""
     while True:
         try:
             rss_sources = [
-                "https://news.google.com/rss/search?q=Tesla+TSLA+analyst+price+target+rating&hl=en-US&gl=US&ceid=US:en",
-                "https://news.google.com/rss/search?q=Tesla+stock+analysis+forecast+2025&hl=en-US&gl=US&ceid=US:en",
-                "https://news.google.com/rss/search?q=TSLA+Wall+Street+analyst+report&hl=en-US&gl=US&ceid=US:en",
+                "https://feeds.finance.yahoo.com/rss/2.0/headline?s=TSLA&region=US&lang=en-US",
+                "https://electrek.co/feed/",
+                "https://www.teslarati.com/feed/",
             ]
-            analyst_keywords = ["analyst", "price target", "rating", "forecast", "outlook", "research",
+            analyst_keywords = ["analyst", "price target", "rating", "forecast", "outlook",
                                "overweight", "underweight", "buy", "sell", "hold", "upgrade", "downgrade",
-                               "initiates", "raises", "cuts", "maintains"]
+                               "initiates", "raises", "cuts", "maintains", "research", "wall street"]
             seen = set()
             articles = []
             for url in rss_sources:
                 try:
                     feed = feedparser.parse(url)
                     for entry in feed.entries[:20]:
-                        title = entry.title.lower()
-                        if entry.title in seen:
+                        title = entry.title
+                        if title in seen:
                             continue
-                        seen.add(entry.title)
-                        if any(kw in title for kw in analyst_keywords):
+                        seen.add(title)
+                        if any(kw in title.lower() for kw in analyst_keywords):
+                            source = entry.get("source", {}).get("title", "") or feed.feed.get("title", "Unknown")
                             articles.append({
-                                "title": entry.title,
+                                "title": title,
                                 "url": entry.link,
-                                "source": entry.get("source", {}).get("title", "Unknown"),
+                                "source": source,
                                 "published": entry.get("published", ""),
                             })
                 except Exception as e:
                     print(f"[Analyst] RSS error: {e}")
+            print(f"[Analyst] Loaded {len(articles)} articles")
             with cache_lock:
                 cache["analyst_articles"] = articles[:6]
         except Exception as e:

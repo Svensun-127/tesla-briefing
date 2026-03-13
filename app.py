@@ -19,6 +19,7 @@ cache = {
     "ratings": [],
     "tweets": [],
     "recommendation": None,
+    "analyst_articles": [],
     "last_full_update": None,
 }
 cache_lock = threading.Lock()
@@ -103,27 +104,87 @@ def refresh_candles():
 def refresh_news():
     while True:
         try:
-            url = "https://news.google.com/rss/search?q=Tesla+TSLA+stock&hl=en-US&gl=US&ceid=US:en"
-            feed = feedparser.parse(url)
-            excluded = ["fox news", "msnbc", "buzzfeed", "tmz"]
+            # 多个RSS源：非主流客观媒体
+            rss_sources = [
+                "https://news.google.com/rss/search?q=Tesla+TSLA+stock&hl=en-US&gl=US&ceid=US:en",
+                "https://feeds.finance.yahoo.com/rss/2.0/headline?s=TSLA&region=US&lang=en-US",
+                "https://news.google.com/rss/search?q=Tesla+electric+vehicle+analysis&hl=en-US&gl=US&ceid=US:en",
+            ]
+            # 排除主流偏见媒体，保留客观专业来源
+            excluded = ["fox news", "msnbc", "buzzfeed", "tmz", "daily mail", "new york post", "breitbart"]
+            # 优先保留的专业财经媒体
+            preferred = ["reuters", "bloomberg", "wsj", "wall street", "barron", "seeking alpha",
+                        "investopedia", "motley fool", "electrek", "teslarati", "the verge",
+                        "ars technica", "techcrunch", "financial times", "marketwatch", "benzinga"]
+            seen = set()
             news = []
-            for entry in feed.entries[:20]:
-                source = entry.get("source", {}).get("title", "Unknown")
-                if any(ex in source.lower() for ex in excluded):
-                    continue
-                news.append({
-                    "title": entry.title,
-                    "url": entry.link,
-                    "source": source,
-                    "published": entry.get("published", ""),
-                })
-                if len(news) >= 6:
-                    break
+            for url in rss_sources:
+                try:
+                    feed = feedparser.parse(url)
+                    for entry in feed.entries[:30]:
+                        title = entry.title
+                        if title in seen:
+                            continue
+                        seen.add(title)
+                        source = entry.get("source", {}).get("title", "Unknown")
+                        if any(ex in source.lower() for ex in excluded):
+                            continue
+                        is_preferred = any(p in source.lower() for p in preferred)
+                        pub = entry.get("published", "")
+                        news.append({
+                            "title": title,
+                            "url": entry.link,
+                            "source": source,
+                            "published": pub,
+                            "preferred": is_preferred,
+                        })
+                except Exception as e:
+                    print(f"[News] RSS error: {e}")
+            # 优先显示preferred来源，然后按时间排序
+            news.sort(key=lambda x: (not x["preferred"], x.get("published", "")), reverse=False)
+            news = [{"title": n["title"], "url": n["url"], "source": n["source"], "published": n["published"]} for n in news[:8]]
             with cache_lock:
                 cache["news"] = news
         except Exception as e:
             print(f"[News] {e}")
-        time.sleep(3600)
+        time.sleep(900)  # 每15分钟刷新
+
+def refresh_analyst_articles():
+    """抓取分析师分析文章"""
+    while True:
+        try:
+            rss_sources = [
+                "https://news.google.com/rss/search?q=Tesla+TSLA+analyst+price+target+rating&hl=en-US&gl=US&ceid=US:en",
+                "https://news.google.com/rss/search?q=Tesla+stock+analysis+forecast+2025&hl=en-US&gl=US&ceid=US:en",
+                "https://news.google.com/rss/search?q=TSLA+Wall+Street+analyst+report&hl=en-US&gl=US&ceid=US:en",
+            ]
+            analyst_keywords = ["analyst", "price target", "rating", "forecast", "outlook", "research",
+                               "overweight", "underweight", "buy", "sell", "hold", "upgrade", "downgrade",
+                               "initiates", "raises", "cuts", "maintains"]
+            seen = set()
+            articles = []
+            for url in rss_sources:
+                try:
+                    feed = feedparser.parse(url)
+                    for entry in feed.entries[:20]:
+                        title = entry.title.lower()
+                        if entry.title in seen:
+                            continue
+                        seen.add(entry.title)
+                        if any(kw in title for kw in analyst_keywords):
+                            articles.append({
+                                "title": entry.title,
+                                "url": entry.link,
+                                "source": entry.get("source", {}).get("title", "Unknown"),
+                                "published": entry.get("published", ""),
+                            })
+                except Exception as e:
+                    print(f"[Analyst] RSS error: {e}")
+            with cache_lock:
+                cache["analyst_articles"] = articles[:6]
+        except Exception as e:
+            print(f"[Analyst] {e}")
+        time.sleep(900)
 
 # ── 评级变动（用Twelve Data，1小时刷新）──────────────────────
 def refresh_ratings():
@@ -264,7 +325,8 @@ def delayed(fn, delay):
     fn()
 
 for i, fn in enumerate([refresh_quote, refresh_candles, refresh_news,
-                         refresh_ratings, refresh_tweets, refresh_recommendation]):
+                         refresh_ratings, refresh_tweets, refresh_recommendation,
+                         refresh_analyst_articles]):
     threading.Thread(target=delayed, args=(fn, i * 8), daemon=True).start()
 
 # ── HTML ─────────────────────────────────────────────────────
@@ -273,7 +335,7 @@ HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Tesla 每日简报</title>
+<title>Tesla小助手</title>
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -330,7 +392,7 @@ body{background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFo
       <path d="M0 66.5C56.9 66.5 85.4 78.3 85.4 78.3L171 342l85.6-263.7S285.1 66.5 342 66.5V0C285.1 0 256.6 11.7 256.6 11.7L171 275.4 85.4 11.7S56.9 0 0 0v66.5z"/>
       <path d="M171 66.5c-27.6 0-85.6-11.7-85.6-11.7S57 66.5 0 66.5c0 0 28.5 11.7 85.4 11.7H171h85.6c56.9 0 85.4-11.7 85.4-11.7-57 0-85.4-11.7-85.4-11.7S198.6 66.5 171 66.5z"/>
     </svg>
-    <h1>Tesla 每日简报</h1>
+    <h1>Tesla小助手</h1>
   </div>
   <div class="price-area">
     <button class="refresh-btn" onclick="location.reload()">刷新页面</button>
@@ -347,6 +409,10 @@ body{background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFo
   <div class="section">
     <div class="sec-title">📰 最新资讯</div>
     <div class="sec-body" id="news-body"><div class="empty">加载中...</div></div>
+  </div>
+  <div class="section">
+    <div class="sec-title">🔬 分析师分析文章</div>
+    <div class="sec-body" id="analyst-body"><div class="empty">加载中...</div></div>
   </div>
   <div class="section">
     <div class="sec-title">📊 近期股价走势 <span id="candle-count" style="color:#555;font-weight:400;font-size:11px"></span></div>
@@ -425,6 +491,11 @@ async function loadFull(){
         <div class="score-card score-sell"><div class="score-label">SELL</div><div class="score-num">${rec.sell}</div><div class="score-bar-wrap"><div class="score-bar" style="width:${rec.sell*10}%"></div></div></div>
       </div><div class="score-meta">基于 <strong>${rec.num_analysts}</strong> 位分析师共识 · 均值 ${rec.mean}/5.0 · <a href="https://finance.yahoo.com/quote/TSLA/analysis/" target="_blank">查看详情</a></div>`;
     }
+    // 分析师文章
+    const ab=document.getElementById('analyst-body');
+    if(ab){
+      ab.innerHTML=(d.analyst_articles&&d.analyst_articles.length)?d.analyst_articles.map(n=>`<div class="news-item"><div class="news-title"><a href="${n.url}" target="_blank">${n.title}</a></div><div class="news-meta">${n.source} · ${n.published?new Date(n.published).toLocaleDateString('zh-CN'):''}</div></div>`).join(''):'<div class="empty">暂无分析师文章</div>';
+    }
     document.getElementById('full-time').textContent=d.last_full_update||'—';
   }catch(e){}
 }
@@ -458,6 +529,7 @@ def api_full():
             "tweets": cache["tweets"],
             "ratings": cache["ratings"],
             "recommendation": cache["recommendation"],
+            "analyst_articles": cache["analyst_articles"],
             "last_full_update": cache["last_full_update"],
         })
 

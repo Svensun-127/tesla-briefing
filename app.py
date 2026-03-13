@@ -9,10 +9,14 @@ import re
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# 初始化Flask应用
 app = Flask(__name__)
+# 时区配置
 BEIJING_TZ = timezone(timedelta(hours=8))
+# API密钥（备用股价源）
 TWELVE_KEY = os.environ.get("TWELVE_API_KEY", "aab68d4088ec4f7d9762027839651f8b")
 TWELVE_BASE = "https://api.twelvedata.com"
+# 请求头（适配反爬）
 YF_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
@@ -20,6 +24,7 @@ YF_HEADERS = {
     "Connection": "keep-alive"
 }
 
+# 全局缓存+线程锁（保证多线程安全）
 cache = {
     "quote": {"price": "N/A", "change": "N/A", "change_pct": "N/A", "is_positive": True, "updated": ""},
     "candles": [],
@@ -32,20 +37,28 @@ cache = {
 }
 _lock = threading.Lock()
 
+# 请求重试适配器（解决网络波动）
 session = requests.Session()
 retry_strategy = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
 session.mount("http://", HTTPAdapter(max_retries=retry_strategy))
 
+# 工具函数：获取北京时区时间
 def bj():
     return datetime.now(BEIJING_TZ)
 
+# 1. 实时股价刷新（30秒/次）
 def _refresh_quote():
     fails = 0
     while True:
         ok = False
+        # 主源：Yahoo Finance
         try:
-            r = session.get("https://query1.finance.yahoo.com/v8/finance/chart/TSLA", params={"interval": "1m", "range": "1d"}, headers=YF_HEADERS, timeout=10, verify=False)
+            r = session.get(
+                "https://query1.finance.yahoo.com/v8/finance/chart/TSLA",
+                params={"interval": "1m", "range": "1d"},
+                headers=YF_HEADERS, timeout=10, verify=False
+            )
             r.raise_for_status()
             meta = r.json()["chart"]["result"][0]["meta"]
             price = round(float(meta["regularMarketPrice"]), 2)
@@ -54,14 +67,20 @@ def _refresh_quote():
             pct = round(chg / prev * 100, 2) if prev else 0
             sign = "+" if chg >= 0 else ""
             with _lock:
-                cache["quote"] = {"price": f"${price}", "change": f"{sign}{chg}", "change_pct": f"{sign}{pct}%", "is_positive": chg >= 0, "updated": bj().strftime("%H:%M:%S")}
+                cache["quote"] = {
+                    "price": f"${price}", "change": f"{sign}{chg}", "change_pct": f"{sign}{pct}%",
+                    "is_positive": chg >= 0, "updated": bj().strftime("%H:%M:%S")
+                }
             fails = 0
             ok = True
         except Exception as e:
-            print(f"[Quote/YF] {str(e)[:50]}")
+            print(f"[Quote/YF] 拉取失败: {str(e)[:50]}")
+        # 备用源：Twelve Data
         if not ok:
             try:
-                r = session.get(f"{TWELVE_BASE}/quote", params={"symbol": "TSLA", "apikey": TWELVE_KEY}, timeout=10, verify=False)
+                r = session.get(f"{TWELVE_BASE}/quote",
+                                params={"symbol": "TSLA", "apikey": TWELVE_KEY},
+                                timeout=10, verify=False)
                 r.raise_for_status()
                 d = r.json()
                 price = round(float(d["close"]), 2)
@@ -70,20 +89,29 @@ def _refresh_quote():
                 pct = round(chg / prev * 100, 2) if prev else 0
                 sign = "+" if chg >= 0 else ""
                 with _lock:
-                    cache["quote"] = {"price": f"${price}", "change": f"{sign}{chg}", "change_pct": f"{sign}{pct}%", "is_positive": chg >= 0, "updated": bj().strftime("%H:%M:%S")}
+                    cache["quote"] = {
+                        "price": f"${price}", "change": f"{sign}{chg}", "change_pct": f"{sign}{pct}%",
+                        "is_positive": chg >= 0, "updated": bj().strftime("%H:%M:%S")
+                    }
                 fails = 0
                 ok = True
             except Exception as e:
-                print(f"[Quote/TD] {str(e)[:50]}")
+                print(f"[Quote/TD] 备用源失败: {str(e)[:50]}")
                 fails += 1
+        # 失败后指数退避，成功则30秒刷新
         time.sleep(30 if ok else min(60 * fails, 300))
 
+# 2. K线图刷新（5分钟/次）
 def _refresh_candles():
     fails = 0
     while True:
         ok = False
         try:
-            r = session.get("https://query1.finance.yahoo.com/v8/finance/chart/TSLA", params={"interval": "1m", "range": "1d", "includePrePost": "true"}, headers=YF_HEADERS, timeout=15, verify=False)
+            r = session.get(
+                "https://query1.finance.yahoo.com/v8/finance/chart/TSLA",
+                params={"interval": "1m", "range": "1d", "includePrePost": "true"},
+                headers=YF_HEADERS, timeout=15, verify=False
+            )
             r.raise_for_status()
             res = r.json()["chart"]["result"][0]
             ts_list = res.get("timestamp", [])
@@ -96,26 +124,46 @@ def _refresh_candles():
                     if None in (o, h, l, c): continue
                     v = vols[i] if i < len(vols) else 0
                     dt = datetime.fromtimestamp(ts, tz=BEIJING_TZ)
-                    candles.append({"time": dt.strftime("%m/%d %H:%M"), "open": round(float(o), 2), "high": round(float(h), 2), "low": round(float(l), 2), "close": round(float(c), 2), "volume": int(v)})
-                except:
+                    candles.append({
+                        "time": dt.strftime("%m/%d %H:%M"),
+                        "open": round(float(o), 2), "high": round(float(h), 2),
+                        "low": round(float(l), 2), "close": round(float(c), 2),
+                        "volume": int(v) if v else 0
+                    })
+                except Exception:
                     continue
             with _lock:
                 cache["candles"] = candles
+            print(f"[Candles] 拉取成功，共{len(candles)}根K线")
             fails = 0
             ok = True
         except Exception as e:
-            print(f"[Candles] {str(e)[:50]}")
+            print(f"[Candles/YF] 拉取失败: {str(e)[:50]}")
             fails += 1
         time.sleep(300 if ok else min(120 * fails, 600))
 
+# 3. 客观/非主流媒体新闻刷新（15分钟/次）
 def _refresh_news():
     while True:
         try:
-            sources = ["https://feeds.finance.yahoo.com/rss/2.0/headline?s=TSLA&region=US&lang=en-US", "https://electrek.co/feed/", "https://www.teslarati.com/feed/", "https://feeds.bloomberg.com/energy/rss.xml", "https://www.reutersagency.com/feed/?taxonomy=best-sectors&post_type=best", "https://arstechnica.com/feed/"]
-            excluded = ["fox news", "msnbc", "buzzfeed", "tmz", "daily mail", "new york post", "breitbart", "cnn business", "forbes"]
-            preferred = ["electrek", "teslarati", "reuters", "bloomberg", "ars technica", "seeking alpha", "marketwatch", "benzinga"]
+            # 精选客观/非主流媒体源
+            sources = [
+                "https://feeds.finance.yahoo.com/rss/2.0/headline?s=TSLA&region=US&lang=en-US",
+                "https://electrek.co/feed/",  # 新能源客观媒体
+                "https://www.teslarati.com/feed/",  # 特斯拉垂直客观媒体
+                "https://feeds.bloomberg.com/energy/rss.xml",  # 彭博能源（客观）
+                "https://www.reutersagency.com/feed/?taxonomy=best-sectors&post_type=best",  # 路透财经（客观）
+                "https://arstechnica.com/feed/"  # 非主流科技媒体（客观）
+            ]
+            # 剔除流量/八卦媒体
+            excluded = ["fox news", "msnbc", "buzzfeed", "tmz", "daily mail",
+                        "new york post", "breitbart", "cnn business", "forbes"]
+            # 优先客观媒体
+            preferred = ["electrek", "teslarati", "reuters", "bloomberg", "ars technica",
+                        "seeking alpha", "marketwatch", "benzinga"]
             keywords = ["tesla", "tsla", "elon musk", "ev", "electric vehicle", "tesla stock"]
             seen, items = set(), []
+
             for url in sources:
                 try:
                     feed = feedparser.parse(url)
@@ -124,26 +172,54 @@ def _refresh_news():
                         if not title or title in seen: continue
                         if not any(k in title for k in keywords): continue
                         seen.add(title)
+                        # 提取媒体源
                         src = (e.get("source", {}).get("title") or feed.feed.get("title") or "Unknown").lower()
                         if any(x in src for x in excluded): continue
-                        items.append({"title": e.get("title", "").strip(), "url": e.get("link", "#"), "source": src.title(), "published": e.get("published", ""), "pref": any(p in src for p in preferred)})
-                except:
-                    continue
+                        # 组装新闻数据
+                        items.append({
+                            "title": e.get("title", "").strip(),
+                            "url": e.get("link", "#"),
+                            "source": src.title(),
+                            "published": e.get("published", ""),
+                            "pref": any(p in src for p in preferred)
+                        })
+                except Exception as ex:
+                    print(f"[News/{url.split('/')[2]}] 源拉取失败: {str(ex)[:30]}")
+            # 优先展示核心客观媒体，取前8条
             items.sort(key=lambda x: not x["pref"])
+            result = [{k: v for k, v in x.items() if k != "pref"} for x in items[:8]]
             with _lock:
-                cache["news"] = [{k: v for k, v in x.items() if k != "pref"} for x in items[:8]]
-        except:
-            pass
-        time.sleep(900)
+                cache["news"] = result
+            print(f"[News] 刷新成功，共{len(result)}条客观新闻")
+        except Exception as e:
+            print(f"[News] 全局失败: {str(e)[:50]}")
+        time.sleep(900)  # 15分钟刷新
 
+# 4. 北美投行分析文章刷新（15分钟/次）
 def _refresh_analyst_articles():
     while True:
         try:
-            sources = ["https://feeds.finance.yahoo.com/rss/2.0/headline?s=TSLA&region=US&lang=en-US", "https://seekingalpha.com/api/sa/combined/TSLA.xml", "https://www.teslarati.com/feed/", "https://feeds.bloomberg.com/markets/rss.xml", "https://www.reuters.com/rssFeed/topic/37519"]
-            top_banks = ["morgan stanley", "goldman sachs", "jpmorgan", "wedbush", "barclays", "ubs", "bank of america", "citi", "deutsche bank", "canaccord genuity", "piper sandler", "bernstein", "jefferies", "cowen", "raymond james"]
-            analyst_kws = ["analyst", "price target", "rating", "forecast", "outlook", "overweight", "underweight", "upgrade", "downgrade", "initiates", "raises", "cuts", "research note"]
+            # 投行核心源
+            sources = [
+                "https://feeds.finance.yahoo.com/rss/2.0/headline?s=TSLA&region=US&lang=en-US",
+                "https://seekingalpha.com/api/sa/combined/TSLA.xml",  # 投行研报核心平台
+                "https://www.teslarati.com/feed/",
+                "https://feeds.bloomberg.com/markets/rss.xml",  # 彭博投行研报
+                "https://www.reuters.com/rssFeed/topic/37519"  # 路透特斯拉财经
+            ]
+            # 北美顶级投行关键词
+            top_banks = [
+                "morgan stanley", "goldman sachs", "jpmorgan", "wedbush", "barclays",
+                "ubs", "bank of america", "citi", "deutsche bank", "canaccord genuity",
+                "piper sandler", "bernstein", "jefferies", "cowen", "raymond james"
+            ]
+            analyst_kws = [
+                "analyst", "price target", "rating", "forecast", "outlook", "overweight",
+                "underweight", "upgrade", "downgrade", "initiates", "raises", "cuts", "research note"
+            ]
             all_kws = top_banks + analyst_kws
             seen, articles = set(), []
+
             for url in sources:
                 try:
                     feed = feedparser.parse(url)
@@ -151,25 +227,39 @@ def _refresh_analyst_articles():
                         title = (e.get("title") or "").strip().lower()
                         if not title or title in seen: continue
                         seen.add(title)
+                        # 筛选含投行/分析术语的文章
                         if any(k in title for k in all_kws):
                             src = (e.get("source", {}).get("title") or feed.feed.get("title") or "Unknown").title()
-                            articles.append({"title": e.get("title", "").strip(), "url": e.get("link", "#"), "source": src, "published": e.get("published", "")})
-                except:
-                    continue
+                            articles.append({
+                                "title": e.get("title", "").strip(),
+                                "url": e.get("link", "#"),
+                                "source": src,
+                                "published": e.get("published", "")
+                            })
+                except Exception as ex:
+                    print(f"[Analyst/{url.split('/')[2]}] 源拉取失败: {str(ex)[:30]}")
+            # 取前6条投行分析文章
             with _lock:
                 cache["analyst_articles"] = articles[:6]
-        except:
-            pass
-        time.sleep(900)
+            print(f"[Analyst] 刷新成功，共{len(articles)}条投行分析文章")
+        except Exception as e:
+            print(f"[Analyst] 全局失败: {str(e)[:50]}")
+        time.sleep(900)  # 15分钟刷新
 
+# 5. 投行评级变动刷新（1小时/次）
 def _refresh_ratings():
     fails = 0
     while True:
         try:
-            r = session.get("https://query1.finance.yahoo.com/v10/finance/quoteSummary/TSLA", params={"modules": "upgradeDowngradeHistory"}, headers=YF_HEADERS, timeout=10, verify=False)
+            r = session.get(
+                "https://query1.finance.yahoo.com/v10/finance/quoteSummary/TSLA",
+                params={"modules": "upgradeDowngradeHistory"},
+                headers=YF_HEADERS, timeout=10, verify=False
+            )
             r.raise_for_status()
+            # 解析投行评级历史
             history = r.json().get("quoteSummary", {}).get("result", [{}])[0].get("upgradeDowngradeHistory", {}).get("history", [])
-            cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=7)  # 近7天评级
             result = []
             for item in history:
                 try:
@@ -177,84 +267,129 @@ def _refresh_ratings():
                     if not epoch: continue
                     dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
                     if dt < cutoff: continue
+                    # 筛选北美顶级投行评级
                     firm = item.get("firm", "Unknown").lower()
                     if any(bank in firm for bank in ["morgan stanley", "goldman", "jpmorgan", "wedbush", "ubs", "bofa", "citi"]):
-                        result.append({"date": dt.astimezone(BEIJING_TZ).strftime("%Y-%m-%d"), "firm": item.get("firm", "Unknown").title(), "from_grade": item.get("fromGrade") or "—", "to_grade": item.get("toGrade") or "—", "url": "https://finance.yahoo.com/quote/TSLA/analysis/"})
+                        result.append({
+                            "date": dt.astimezone(BEIJING_TZ).strftime("%Y-%m-%d"),
+                            "firm": item.get("firm", "Unknown").title(),
+                            "from_grade": item.get("fromGrade") or "—",
+                            "to_grade": item.get("toGrade") or "—",
+                            "url": "https://finance.yahoo.com/quote/TSLA/analysis/"
+                        })
                     if len(result) >= 8: break
-                except:
+                except Exception:
                     continue
             with _lock:
                 cache["ratings"] = result
+            print(f"[Ratings] 刷新成功，近7天共{len(result)}条投行评级变动")
             fails = 0
-            time.sleep(3600)
+            time.sleep(3600)  # 1小时刷新
         except Exception as e:
-            print(f"[Ratings] {str(e)[:50]}")
+            print(f"[Ratings] 拉取失败: {str(e)[:50]}")
             fails += 1
             time.sleep(min(120 * fails, 600))
 
+# 6. 马斯克推文刷新（30分钟/次）
 def _refresh_tweets():
-    nitter_mirrors = ["https://nitter.poast.org/elonmusk/rss", "https://nitter.privacydev.net/elonmusk/rss", "https://nitter.nixnet.services/elonmusk/rss", "https://nitter.1d4.us/elonmusk/rss"]
+    # 高可用Nitter镜像
+    nitter_mirrors = [
+        "https://nitter.poast.org/elonmusk/rss",
+        "https://nitter.privacydev.net/elonmusk/rss",
+        "https://nitter.nixnet.services/elonmusk/rss",
+        "https://nitter.1d4.us/elonmusk/rss"
+    ]
     while True:
         try:
             cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
             tweets = []
+            # 遍历镜像，拉取成功则停止
             for url in nitter_mirrors:
                 try:
                     feed = feedparser.parse(url, timeout=10)
                     if not feed.entries: continue
                     for e in feed.entries[:30]:
+                        # 过滤转发推文
                         title = e.get("title", "")
                         if title.startswith(("RT @", "R to @", "Retweet")): continue
+                        # 过滤24小时外的推文
                         pp = e.get("published_parsed")
                         if pp:
                             pub_dt = datetime(*pp[:6], tzinfo=timezone.utc)
                             if pub_dt < cutoff: continue
+                        # 清洗推文内容
                         raw = e.get("summary", title)
                         text = re.sub(r"<[^>]+>", "", raw).strip()
                         text = re.sub(r"\s+", " ", text)
-                        tweets.append({"text": text[:400], "url": e.get("link", "https://x.com/elonmusk"), "published": e.get("published", "")})
-                        if len(tweets) >= 5: break
-                    if tweets: break
-                except:
-                    continue
+                        tweets.append({
+                            "text": text[:400],
+                            "url": e.get("link", "https://x.com/elonmusk"),
+                            "published": e.get("published", "")
+                        })
+                        if len(tweets) >= 5: break  # 取前5条
+                    if tweets:
+                        print(f"[Tweets] 从{url}拉取成功，共{len(tweets)}条")
+                        break
+                except Exception as ex:
+                    print(f"[Tweets/{url.split('/')[2]}] 镜像失败: {str(ex)[:30]}")
             with _lock:
                 cache["tweets"] = tweets
-        except:
-            pass
-        time.sleep(1800)
+        except Exception as e:
+            print(f"[Tweets] 全局失败: {str(e)[:50]}")
+        time.sleep(1800)  # 30分钟刷新
 
+# 7. 投行共识评分刷新（1小时/次）
 def _refresh_recommendation():
     fails = 0
     while True:
         try:
-            r = session.get("https://query1.finance.yahoo.com/v10/finance/quoteSummary/TSLA", params={"modules": "recommendationTrend"}, headers=YF_HEADERS, timeout=10, verify=False)
+            r = session.get(
+                "https://query1.finance.yahoo.com/v10/finance/quoteSummary/TSLA",
+                params={"modules": "recommendationTrend"},
+                headers=YF_HEADERS, timeout=10, verify=False
+            )
             r.raise_for_status()
             trends = r.json().get("quoteSummary", {}).get("result", [{}])[0].get("recommendationTrend", {}).get("trend", [])
             rec = None
             if trends:
                 t = trends[0]
+                # 解析分析师评分
                 sb, b, h, s, ss = map(int, [t.get(k, 0) for k in ["strongBuy", "buy", "hold", "sell", "strongSell"]])
                 tot = sb + b + h + s + ss
                 if tot > 0:
-                    rec = {"buy": min(round((sb * 10 + b * 7) / tot, 1), 10), "hold": min(round(h * 10 / tot, 1), 10), "sell": min(round((s * 7 + ss * 10) / tot, 1), 10), "num_analysts": tot, "mean": round((sb*1 + b*2 + h*3 + s*4 + ss*5) / tot, 2)}
+                    rec = {
+                        "buy": min(round((sb * 10 + b * 7) / tot, 1), 10),
+                        "hold": min(round(h * 10 / tot, 1), 10),
+                        "sell": min(round((s * 7 + ss * 10) / tot, 1), 10),
+                        "num_analysts": tot,
+                        "mean": round((sb*1 + b*2 + h*3 + s*4 + ss*5) / tot, 2),
+                    }
             with _lock:
                 cache["recommendation"] = rec
                 cache["last_full_update"] = bj().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[Rec] 投行共识评分刷新: {rec}")
             fails = 0
             time.sleep(3600)
         except Exception as e:
-            print(f"[Rec] {str(e)[:50]}")
+            print(f"[Rec] 拉取失败: {str(e)[:50]}")
             fails += 1
             time.sleep(min(120 * fails, 600))
 
+# 后台线程启动（错开5秒，避免同时请求）
 def _run_worker(fn, delay):
     time.sleep(delay)
     fn()
 
-workers = [_refresh_quote, _refresh_candles, _refresh_news, _refresh_analyst_articles, _refresh_ratings, _refresh_tweets, _refresh_recommendation]
+# 注册所有工作线程
+workers = [
+    _refresh_quote, _refresh_candles, _refresh_news,
+    _refresh_analyst_articles, _refresh_ratings,
+    _refresh_tweets, _refresh_recommendation
+]
 for idx, fn in enumerate(workers):
     threading.Thread(target=_run_worker, args=(fn, idx * 5), daemon=True).start()
 
+# 前端HTML（完全保留原UI）
 HTML = """<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -400,7 +535,8 @@ async function refreshQuote(){
     const d = await (await fetch('/api/quote')).json();
     document.getElementById('price').textContent = d.price;
     document.getElementById('price').className = 'price-big ' + (d.is_positive ? 'pos' : 'neg');
-    document.getElementById('change').innerHTML = `<span class="${d.is_positive?'pos':'neg'}">${d.change} (${d.change_pct})</span>`;
+    document.getElementById('change').innerHTML =
+      `<span class="${d.is_positive?'pos':'neg'}">${d.change} (${d.change_pct})</span>`;
     document.getElementById('quote-time').textContent = d.updated || '—';
   }catch(e){}
 }
@@ -413,40 +549,91 @@ async function refreshCandles(){
 async function loadFull(){
   try{
     const d = await (await fetch('/api/full')).json();
+    // 新闻渲染
     const nb = document.getElementById('news-body');
-    nb.innerHTML = d.news.length ? d.news.map(n=>`<div class="news-item"><div class="news-title"><a href="${n.url}" target="_blank">${n.title}</a></div><div class="news-meta">${n.source} · ${n.published ? new Date(n.published).toLocaleDateString('zh-CN') : ''}</div></div>`).join('') : '<div class="empty">暂无新闻</div>';
+    nb.innerHTML = d.news.length
+      ? d.news.map(n=>`<div class="news-item">
+          <div class="news-title"><a href="${n.url}" target="_blank">${n.title}</a></div>
+          <div class="news-meta">${n.source} · ${n.published ? new Date(n.published).toLocaleDateString('zh-CN') : ''}</div>
+        </div>`).join('')
+      : '<div class="empty">暂无新闻</div>';
+    // 推文渲染
     const tb = document.getElementById('tweets-body');
-    tb.innerHTML = d.tweets.length ? d.tweets.map(t=>`<div class="tweet-item">${t.text}<a href="${t.url}" target="_blank" class="tweet-link">→ 查看原推文</a></div>`).join('') : '<div class="empty">暂时无法获取推文 · <a href="https://x.com/elonmusk" target="_blank" style="color:#58a6ff">前往X查看</a></div>';
+    tb.innerHTML = d.tweets.length
+      ? d.tweets.map(t=>`<div class="tweet-item">${t.text}
+          <a href="${t.url}" target="_blank" class="tweet-link">→ 查看原推文</a>
+        </div>`).join('')
+      : '<div class="empty">暂时无法获取推文 · <a href="https://x.com/elonmusk" target="_blank" style="color:#58a6ff">前往X查看</a></div>';
+    // 评级渲染
     const rb = document.getElementById('ratings-body');
-    rb.innerHTML = d.ratings.length ? d.ratings.map(r=>`<div class="rating-row"><div class="firm">${r.firm}</div><span class="grade ${gc(r.from_grade)}">${r.from_grade||'—'}</span><span class="arrow">→</span><span class="grade ${gc(r.to_grade)}">${r.to_grade||'—'}</span><span style="color:#8b949e;font-size:11px;margin-left:auto">${r.date}</span><a href="${r.url}" target="_blank" style="color:#58a6ff;font-size:11px">详情</a></div>`).join('') : '<div class="empty">近7天暂无评级变动</div>';
+    rb.innerHTML = d.ratings.length
+      ? d.ratings.map(r=>`<div class="rating-row">
+          <div class="firm">${r.firm}</div>
+          <span class="grade ${gc(r.from_grade)}">${r.from_grade||'—'}</span>
+          <span class="arrow">→</span>
+          <span class="grade ${gc(r.to_grade)}">${r.to_grade||'—'}</span>
+          <span style="color:#8b949e;font-size:11px;margin-left:auto">${r.date}</span>
+          <a href="${r.url}" target="_blank" style="color:#58a6ff;font-size:11px">详情</a>
+        </div>`).join('')
+      : '<div class="empty">近7天暂无评级变动</div>';
+    // 评分渲染
     const rec = d.recommendation;
-    const eb = document.getElementById('rec-body');
+    const eb  = document.getElementById('rec-body');
     const badge = document.getElementById('verdict-badge');
     if(!rec){
       eb.innerHTML = '<div class="empty">暂无分析师共识数据</div>';
       badge.innerHTML = '';
     } else {
-      const top = [{k:'buy',v:rec.buy},{k:'hold',v:rec.hold},{k:'sell',v:rec.sell}].sort((a,b)=>b.v-a.v)[0];
+      const top = [{k:'buy',v:rec.buy},{k:'hold',v:rec.hold},{k:'sell',v:rec.sell}]
+                    .sort((a,b)=>b.v-a.v)[0];
       badge.innerHTML = `<span class="verdict v-${top.k}">${top.k.toUpperCase()}</span>`;
-      eb.innerHTML = `<div class="score-grid"><div class="score-card score-buy"><div class="score-label">BUY</div><div class="score-num">${rec.buy}</div><div class="score-bar-wrap"><div class="score-bar" style="width:${rec.buy*10}%"></div></div></div><div class="score-card score-hold"><div class="score-label">HOLD</div><div class="score-num">${rec.hold}</div><div class="score-bar-wrap"><div class="score-bar" style="width:${rec.hold*10}%"></div></div></div><div class="score-card score-sell"><div class="score-label">SELL</div><div class="score-num">${rec.sell}</div><div class="score-bar-wrap"><div class="score-bar" style="width:${rec.sell*10}%"></div></div></div></div><div class="score-meta">基于 <strong>${rec.num_analysts}</strong> 位分析师共识 · 均值 ${rec.mean}/5.0 · <a href="https://finance.yahoo.com/quote/TSLA/analysis/" target="_blank">查看详情</a></div>`;
+      eb.innerHTML = `<div class="score-grid">
+        <div class="score-card score-buy">
+          <div class="score-label">BUY</div>
+          <div class="score-num">${rec.buy}</div>
+          <div class="score-bar-wrap"><div class="score-bar" style="width:${rec.buy*10}%"></div></div>
+        </div>
+        <div class="score-card score-hold">
+          <div class="score-label">HOLD</div>
+          <div class="score-num">${rec.hold}</div>
+          <div class="score-bar-wrap"><div class="score-bar" style="width:${rec.hold*10}%"></div></div>
+        </div>
+        <div class="score-card score-sell">
+          <div class="score-label">SELL</div>
+          <div class="score-num">${rec.sell}</div>
+          <div class="score-bar-wrap"><div class="score-bar" style="width:${rec.sell*10}%"></div></div>
+        </div>
+      </div>
+      <div class="score-meta">基于 <strong>${rec.num_analysts}</strong> 位分析师共识 · 均值 ${rec.mean}/5.0 ·
+        <a href="https://finance.yahoo.com/quote/TSLA/analysis/" target="_blank">查看详情</a>
+      </div>`;
     }
+    // 分析师文章渲染
     const ab = document.getElementById('analyst-body');
     if(ab){
-      ab.innerHTML = (d.analyst_articles && d.analyst_articles.length) ? d.analyst_articles.map(n=>`<div class="news-item"><div class="news-title"><a href="${n.url}" target="_blank">${n.title}</a></div><div class="news-meta">${n.source} · ${n.published ? new Date(n.published).toLocaleDateString('zh-CN') : ''}</div></div>`).join('') : '<div class="empty">暂无分析师文章</div>';
+      ab.innerHTML = (d.analyst_articles && d.analyst_articles.length)
+        ? d.analyst_articles.map(n=>`<div class="news-item">
+            <div class="news-title"><a href="${n.url}" target="_blank">${n.title}</a></div>
+            <div class="news-meta">${n.source} · ${n.published ? new Date(n.published).toLocaleDateString('zh-CN') : ''}</div>
+          </div>`).join('')
+        : '<div class="empty">暂无分析师文章</div>';
     }
     document.getElementById('full-time').textContent = d.last_full_update || '—';
   }catch(e){ console.error(e); }
 }
+// 初始化加载
 refreshQuote();
 refreshCandles();
 loadFull();
-setInterval(refreshQuote, 30000);
+// 定时刷新
+setInterval(refreshQuote,   30000);
 setInterval(refreshCandles, 300000);
-setInterval(loadFull, 3600000);
+setInterval(loadFull,       3600000);
 </script>
 </body>
 </html>"""
 
+# API接口路由
 @app.route("/")
 def index():
     return render_template_string(HTML)
@@ -464,7 +651,13 @@ def api_candles():
 @app.route("/api/full")
 def api_full():
     with _lock:
-        return jsonify({"news": cache["news"], "analyst_articles": cache["analyst_articles"], "tweets": cache["tweets"], "ratings": cache["ratings"], "recommendation": cache["recommendation"], "last_full_update": cache["last_full_update"]})
+        return jsonify({
+            "news": cache["news"], "analyst_articles": cache["analyst_articles"],
+            "tweets": cache["tweets"], "ratings": cache["ratings"],
+            "recommendation": cache["recommendation"], "last_full_update": cache["last_full_update"]
+        })
 
+# 启动服务（适配Render环境）
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
